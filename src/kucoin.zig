@@ -1,12 +1,26 @@
 const std = @import("std");
 const ws = @import("websocket");
 const request = @import("./request.zig");
-const net = std.net;
-const http = std.http;
 const json = std.json;
 const crypto = std.crypto;
-const base64 = std.base64;
-const ArrayList = std.ArrayList;
+
+const TickerDataNumeric = struct {
+    bestAsk: f64,
+    bestAskSize: f64,
+    bestBid: f64,
+    bestBidSize: f64,
+    price: f64,
+    sequence: u64,
+    size: f64,
+    time: i64,
+};
+
+const MarketTickerNumeric = struct {
+    topic: []const u8,
+    type: []const u8,
+    subject: []const u8,
+    data: TickerDataNumeric,
+};
 
 const KuCoinTokenResponse = struct {
     code: []const u8,
@@ -38,8 +52,12 @@ ping_interval: u64,
 ping_timeout: u64,
 mutex: std.Thread.Mutex,
 client: ?ws.Client,
+nats: ?std.net.Stream,
 
-pub fn init(allocator: std.mem.Allocator) Self {
+pub fn init(allocator: std.mem.Allocator) !Self {
+    // Connect to NATS (assuming localhost:4222), TODO: make env var driven
+    const natsStream = try std.net.tcpConnectToHost(allocator, "0.0.0.0", 4222);
+
     return Self{
         .allocator = allocator,
         .token = null,
@@ -48,6 +66,7 @@ pub fn init(allocator: std.mem.Allocator) Self {
         .ping_timeout = 10000,
         .mutex = std.Thread.Mutex{},
         .client = null,
+        .nats = natsStream,
     };
 }
 
@@ -55,6 +74,7 @@ pub fn deinit(self: *Self) void {
     if (self.token) |token| self.allocator.free(token);
     if (self.endpoint) |endpoint| self.allocator.free(endpoint);
     if (self.client) |*client| client.deinit();
+    if (self.nats) |*nats| nats.close();
 }
 
 pub fn getSocketConnectionDetails(self: *Self) !void {
@@ -168,10 +188,9 @@ pub fn consume(self: *Self) !void {
 
             switch (msg.type) {
                 .text => {
-                    std.log.info("Received: {s}", .{msg.data});
+                    // std.log.info("Received: {s}", .{msg.data});
 
-                    // Try to parse as JSON to identify message type
-                    var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, msg.data, .{}) catch |err| {
+                    const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, msg.data, .{}) catch |err| {
                         std.log.warn("Failed to parse message as JSON: {}", .{err});
                         continue;
                     };
@@ -182,18 +201,26 @@ pub fn consume(self: *Self) !void {
                             .string => |type_str| {
                                 if (std.mem.eql(u8, type_str, "welcome")) {
                                     std.log.info("✓ Welcome message received", .{});
-                                } else if (std.mem.eql(u8, type_str, "ack")) {
+                                    continue;
+                                }
+
+                                if (std.mem.eql(u8, type_str, "ack")) {
                                     std.log.info("✓ Subscription acknowledged", .{});
-                                } else if (std.mem.eql(u8, type_str, "message")) {
-                                    if (parsed.value.object.get("subject")) |subject| {
-                                        switch (subject) {
-                                            .string => |subject_str| {
-                                                std.log.info("📊 Market data for {s}", .{subject_str});
-                                            },
-                                            else => {},
-                                        }
-                                    }
-                                } else if (std.mem.eql(u8, type_str, "error")) {
+                                    continue;
+                                }
+
+                                if (std.mem.eql(u8, type_str, "message")) {
+                                    const nats_msg = try std.fmt.allocPrint(self.allocator, "PUB {s} {d}\r\n{s}\r\n", .{ "market", msg.data.len, msg.data });
+                                    errdefer self.allocator.free(nats_msg);
+                                    defer self.allocator.free(nats_msg);
+
+                                    self.nats.?.writeAll(nats_msg) catch |err| {
+                                        std.log.err("Failed to write message to NATS: {}", .{err});
+                                    };
+                                    continue;
+                                }
+
+                                if (std.mem.eql(u8, type_str, "error")) {
                                     std.log.err("❌ WebSocket error: {s}", .{msg.data});
                                 }
                             },
@@ -223,4 +250,28 @@ pub fn consume(self: *Self) !void {
     }
 
     std.log.info("WebSocket connection closed", .{});
+}
+
+fn parseNumericTicker(self: *Self, json_string: []const u8) !MarketTickerNumeric {
+    const parsed = try std.json.parseFromSlice(MarketTickerNumeric, self.allocator, json_string, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    const ticker = parsed.value;
+
+    // Convert string values to numeric
+    return MarketTickerNumeric{
+        .topic = try self.allocator.dupe(u8, ticker.topic),
+        .type = try self.allocator.dupe(u8, ticker.type),
+        .subject = try self.allocator.dupe(u8, ticker.subject),
+        .data = TickerDataNumeric{
+            .bestAsk = try std.fmt.parseFloat(f64, ticker.data.bestAsk),
+            .bestAskSize = try std.fmt.parseFloat(f64, ticker.data.bestAskSize),
+            .bestBid = try std.fmt.parseFloat(f64, ticker.data.bestBid),
+            .bestBidSize = try std.fmt.parseFloat(f64, ticker.data.bestBidSize),
+            .price = try std.fmt.parseFloat(f64, ticker.data.price),
+            .sequence = try std.fmt.parseInt(u64, ticker.data.sequence, 10),
+            .size = try std.fmt.parseFloat(f64, ticker.data.size),
+            .time = ticker.data.time,
+        },
+    };
 }

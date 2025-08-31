@@ -6,12 +6,12 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var kc = kucoin.init(allocator);
+    var kc = try kucoin.init(allocator);
     defer kc.deinit();
 
     try kc.getSocketConnectionDetails();
     try kc.connectWebSocket();
-    try kc.subscribeChannel("/market/ticker:BTC-USDT");
+    try kc.subscribeChannel("/spotMarket/level2Depth5:BTC-USDT");
     try kc.consume();
 
     std.log.info("WebSocket connection closed", .{});
