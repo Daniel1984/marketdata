@@ -4,24 +4,6 @@ const request = @import("./request.zig");
 const json = std.json;
 const crypto = std.crypto;
 
-const TickerDataNumeric = struct {
-    bestAsk: f64,
-    bestAskSize: f64,
-    bestBid: f64,
-    bestBidSize: f64,
-    price: f64,
-    sequence: u64,
-    size: f64,
-    time: i64,
-};
-
-const MarketTickerNumeric = struct {
-    topic: []const u8,
-    type: []const u8,
-    subject: []const u8,
-    data: TickerDataNumeric,
-};
-
 const KuCoinTokenResponse = struct {
     code: []const u8,
     data: struct {
@@ -250,28 +232,4 @@ pub fn consume(self: *Self) !void {
     }
 
     std.log.info("WebSocket connection closed", .{});
-}
-
-fn parseNumericTicker(self: *Self, json_string: []const u8) !MarketTickerNumeric {
-    const parsed = try std.json.parseFromSlice(MarketTickerNumeric, self.allocator, json_string, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-
-    const ticker = parsed.value;
-
-    // Convert string values to numeric
-    return MarketTickerNumeric{
-        .topic = try self.allocator.dupe(u8, ticker.topic),
-        .type = try self.allocator.dupe(u8, ticker.type),
-        .subject = try self.allocator.dupe(u8, ticker.subject),
-        .data = TickerDataNumeric{
-            .bestAsk = try std.fmt.parseFloat(f64, ticker.data.bestAsk),
-            .bestAskSize = try std.fmt.parseFloat(f64, ticker.data.bestAskSize),
-            .bestBid = try std.fmt.parseFloat(f64, ticker.data.bestBid),
-            .bestBidSize = try std.fmt.parseFloat(f64, ticker.data.bestBidSize),
-            .price = try std.fmt.parseFloat(f64, ticker.data.price),
-            .sequence = try std.fmt.parseInt(u64, ticker.data.sequence, 10),
-            .size = try std.fmt.parseFloat(f64, ticker.data.size),
-            .time = ticker.data.time,
-        },
-    };
 }
