@@ -25,6 +25,12 @@ const SubscribeMessage = struct {
     response: bool,
 };
 
+const MessageEnvelope = struct {
+    type: []const u8,
+    source: []const u8,
+    data: []const u8,
+};
+
 pub const Self = @This();
 
 allocator: std.mem.Allocator,
@@ -35,12 +41,11 @@ ping_timeout: u64,
 mutex: std.Thread.Mutex,
 client: ?ws.Client,
 nats: ?std.net.Stream,
+last_nats_error_time: i64,
+nats_error_count: u32,
 
 pub fn init(allocator: std.mem.Allocator) !Self {
-    // Connect to NATS (assuming localhost:4222), TODO: make env var driven
-    const natsStream = try std.net.tcpConnectToHost(allocator, "0.0.0.0", 4222);
-
-    return Self{
+    var self = Self{
         .allocator = allocator,
         .token = null,
         .endpoint = null,
@@ -48,15 +53,78 @@ pub fn init(allocator: std.mem.Allocator) !Self {
         .ping_timeout = 10000,
         .mutex = std.Thread.Mutex{},
         .client = null,
-        .nats = natsStream,
+        .nats = null,
+        .last_nats_error_time = 0,
+        .nats_error_count = 0,
     };
+
+    try self.connectNATS();
+    return self;
 }
 
 pub fn deinit(self: *Self) void {
-    if (self.token) |token| self.allocator.free(token);
-    if (self.endpoint) |endpoint| self.allocator.free(endpoint);
-    if (self.client) |*client| client.deinit();
-    if (self.nats) |*nats| nats.close();
+    if (self.token) |token| {
+        self.allocator.free(token);
+        self.token = null;
+    }
+    if (self.endpoint) |endpoint| {
+        self.allocator.free(endpoint);
+        self.endpoint = null;
+    }
+    if (self.client) |*client| {
+        client.deinit();
+        self.client = null;
+    }
+    if (self.nats) |*nats| {
+        nats.close();
+        self.nats = null;
+    }
+}
+
+fn connectNATS(self: *Self) !void {
+    // Connect to NATS (assuming localhost:4222), TODO: make env var driven
+    self.nats = try std.net.tcpConnectToHost(self.allocator, "0.0.0.0", 4222);
+    std.log.info("Connected to NATS", .{});
+    self.nats_error_count = 0; // Reset error count on successful connection
+}
+
+fn reconnectNATS(self: *Self) void {
+    if (self.nats) |*nats| {
+        nats.close();
+        self.nats = null;
+    }
+
+    std.log.info("Attempting to reconnect to NATS...", .{});
+
+    // Try to reconnect with backoff
+    var attempts: u32 = 0;
+    while (attempts < 5) {
+        std.Thread.sleep(std.time.ns_per_s * (@as(u64, attempts) + 1)); // 1s, 2s, 3s, 4s, 5s backoff
+
+        self.connectNATS() catch |err| {
+            attempts += 1;
+            std.log.warn("NATS reconnection attempt {} failed: {}", .{ attempts, err });
+            continue;
+        };
+
+        std.log.info("Successfully reconnected to NATS", .{});
+        return;
+    }
+
+    std.log.err("Failed to reconnect to NATS after {} attempts", .{attempts});
+}
+
+fn handleNATSError(self: *Self, err: anyerror) void {
+    const current_time = std.time.timestamp();
+
+    // Only log errors once every 30 seconds to prevent spam
+    if (current_time - self.last_nats_error_time > 30) {
+        std.log.err("NATS error (count: {}): {}", .{ self.nats_error_count + 1, err });
+        self.last_nats_error_time = current_time;
+        self.nats_error_count = 0;
+    } else {
+        self.nats_error_count += 1;
+    }
 }
 
 pub fn getSocketConnectionDetails(self: *Self) !void {
@@ -72,8 +140,26 @@ pub fn getSocketConnectionDetails(self: *Self) !void {
     if (!std.mem.eql(u8, parsedBody.value.code, "200000")) return error.ConnectionError;
     if (parsedBody.value.data.instanceServers.len == 0) return error.MissingInstanceServers;
 
-    self.token = self.allocator.dupe(u8, parsedBody.value.data.token) catch return error.MissingToken;
-    self.endpoint = self.allocator.dupe(u8, parsedBody.value.data.instanceServers[0].endpoint) catch return error.MissingEndpoint;
+    // Free existing allocations before creating new ones
+    if (self.token) |token| {
+        self.allocator.free(token);
+        self.token = null;
+    }
+    if (self.endpoint) |endpoint| {
+        self.allocator.free(endpoint);
+        self.endpoint = null;
+    }
+
+    // Use temporary variables to avoid partial state on error
+    const token = try self.allocator.dupe(u8, parsedBody.value.data.token);
+    errdefer self.allocator.free(token);
+
+    const endpoint = try self.allocator.dupe(u8, parsedBody.value.data.instanceServers[0].endpoint);
+    errdefer self.allocator.free(endpoint);
+
+    // Only assign after both succeed
+    self.token = token;
+    self.endpoint = endpoint;
     self.ping_interval = parsedBody.value.data.instanceServers[0].pingInterval;
     self.ping_timeout = parsedBody.value.data.instanceServers[0].pingTimeout;
 
@@ -93,6 +179,12 @@ pub fn connectWebSocket(self: *Self) !void {
 
     const port: u16 = uri.port orelse if (std.mem.eql(u8, uri.scheme, "wss")) 443 else 80;
     const is_tls = std.mem.eql(u8, uri.scheme, "wss");
+
+    // Clean up existing client if it exists
+    if (self.client) |*client| {
+        client.deinit();
+        self.client = null;
+    }
 
     self.client = try ws.Client.init(self.allocator, .{
         .port = port,
@@ -155,14 +247,17 @@ pub fn consume(self: *Self) !void {
         // Check if we need to send a ping
         if (ping_timer.read() >= ping_interval_ns) {
             var ping_data = [_]u8{};
-            try self.client.?.writePing(&ping_data);
+            self.client.?.writePing(&ping_data) catch |err| {
+                std.log.err("Failed to send ping: {}", .{err});
+                return err; // Exit consume loop on ping failure
+            };
             std.log.info("Sent ping", .{});
             ping_timer.reset();
         }
 
         const message = self.client.?.read() catch |err| {
             std.log.err("failed reading raw message: {}", .{err});
-            continue;
+            return err; // Exit consume loop on read failure
         };
 
         if (message) |msg| {
@@ -192,13 +287,40 @@ pub fn consume(self: *Self) !void {
                                 }
 
                                 if (std.mem.eql(u8, type_str, "message")) {
-                                    const nats_msg = try std.fmt.allocPrint(self.allocator, "PUB {s} {d}\r\n{s}\r\n", .{ "market", msg.data.len, msg.data });
-                                    errdefer self.allocator.free(nats_msg);
+                                    // Create envelope
+                                    const envelope = MessageEnvelope{
+                                        .type = "orderbook",
+                                        .source = "kucoin",
+                                        .data = msg.data,
+                                    };
+
+                                    // Serialize envelope to JSON
+                                    const envelope_json = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(envelope, .{})});
+                                    defer self.allocator.free(envelope_json);
+
+                                    const nats_msg = try std.fmt.allocPrint(self.allocator, "PUB {s} {d}\r\n{s}\r\n", .{ "market", envelope_json.len, envelope_json });
                                     defer self.allocator.free(nats_msg);
 
-                                    self.nats.?.writeAll(nats_msg) catch |err| {
-                                        std.log.err("Failed to write message to NATS: {}", .{err});
-                                    };
+                                    if (self.nats) |nats| {
+                                        nats.writeAll(nats_msg) catch |err| {
+                                            self.handleNATSError(err);
+                                            // Single retry after reconnection attempt
+                                            self.reconnectNATS();
+                                            if (self.nats) |retry_nats| {
+                                                retry_nats.writeAll(nats_msg) catch |retry_err| {
+                                                    self.handleNATSError(retry_err);
+                                                };
+                                            }
+                                        };
+                                    } else {
+                                        self.handleNATSError(error.NullConnection);
+                                        self.reconnectNATS();
+                                        if (self.nats) |nats| {
+                                            nats.writeAll(nats_msg) catch |err| {
+                                                self.handleNATSError(err);
+                                            };
+                                        }
+                                    }
                                     continue;
                                 }
 
