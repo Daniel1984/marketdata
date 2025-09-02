@@ -2,6 +2,7 @@ const std = @import("std");
 const ws = @import("websocket");
 const request = @import("./request.zig");
 const types = @import("./types.zig");
+const nats_broadcaster = @import("./nats-broadcaster.zig");
 const json = std.json;
 const crypto = std.crypto;
 
@@ -14,12 +15,10 @@ ping_interval: u64,
 ping_timeout: u64,
 mutex: std.Thread.Mutex,
 client: ?ws.Client,
-nats: ?std.net.Stream,
-last_nats_error_time: i64,
-nats_error_count: u32,
+nats: *nats_broadcaster.NatsBroadcaster,
 
-pub fn init(allocator: std.mem.Allocator) !Self {
-    var self = Self{
+pub fn init(allocator: std.mem.Allocator, nats: *nats_broadcaster.NatsBroadcaster) Self {
+    return Self{
         .allocator = allocator,
         .token = null,
         .endpoint = null,
@@ -27,13 +26,8 @@ pub fn init(allocator: std.mem.Allocator) !Self {
         .ping_timeout = 10000,
         .mutex = std.Thread.Mutex{},
         .client = null,
-        .nats = null,
-        .last_nats_error_time = 0,
-        .nats_error_count = 0,
+        .nats = nats,
     };
-
-    try self.connectNATS();
-    return self;
 }
 
 pub fn deinit(self: *Self) void {
@@ -48,56 +42,6 @@ pub fn deinit(self: *Self) void {
     if (self.client) |*client| {
         client.deinit();
         self.client = null;
-    }
-    if (self.nats) |*nats| {
-        nats.close();
-        self.nats = null;
-    }
-}
-
-fn connectNATS(self: *Self) !void {
-    // Connect to NATS (assuming localhost:4222), TODO: make env var driven
-    self.nats = try std.net.tcpConnectToHost(self.allocator, "0.0.0.0", 4222);
-    std.log.info("Connected to NATS", .{});
-    self.nats_error_count = 0; // Reset error count on successful connection
-}
-
-fn reconnectNATS(self: *Self) void {
-    if (self.nats) |*nats| {
-        nats.close();
-        self.nats = null;
-    }
-
-    std.log.info("Attempting to reconnect to NATS...", .{});
-
-    // Try to reconnect with backoff
-    var attempts: u32 = 0;
-    while (attempts < 5) {
-        std.Thread.sleep(std.time.ns_per_s * (@as(u64, attempts) + 1)); // 1s, 2s, 3s, 4s, 5s backoff
-
-        self.connectNATS() catch |err| {
-            attempts += 1;
-            std.log.warn("NATS reconnection attempt {} failed: {}", .{ attempts, err });
-            continue;
-        };
-
-        std.log.info("Successfully reconnected to NATS", .{});
-        return;
-    }
-
-    std.log.err("Failed to reconnect to NATS after {} attempts", .{attempts});
-}
-
-fn handleNATSError(self: *Self, err: anyerror) void {
-    const current_time = std.time.timestamp();
-
-    // Only log errors once every 30 seconds to prevent spam
-    if (current_time - self.last_nats_error_time > 30) {
-        std.log.err("NATS error (count: {}): {}", .{ self.nats_error_count + 1, err });
-        self.last_nats_error_time = current_time;
-        self.nats_error_count = 0;
-    } else {
-        self.nats_error_count += 1;
     }
 }
 
@@ -261,40 +205,9 @@ pub fn consume(self: *Self) !void {
                                 }
 
                                 if (std.mem.eql(u8, type_str, "message")) {
-                                    // Create envelope
-                                    const envelope = types.MessageEnvelope{
-                                        .type = "orderbook",
-                                        .source = "kucoin",
-                                        .data = msg.data,
+                                    self.nats.publishMessage("market", .{ .data = msg.data, .type = "orderbook", .source = "kucoin" }) catch |err| {
+                                        std.log.warn("Failed to publish to NATS: {}", .{err});
                                     };
-
-                                    // Serialize envelope to JSON
-                                    const envelope_json = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(envelope, .{})});
-                                    defer self.allocator.free(envelope_json);
-
-                                    const nats_msg = try std.fmt.allocPrint(self.allocator, "PUB {s} {d}\r\n{s}\r\n", .{ "market", envelope_json.len, envelope_json });
-                                    defer self.allocator.free(nats_msg);
-
-                                    if (self.nats) |nats| {
-                                        nats.writeAll(nats_msg) catch |err| {
-                                            self.handleNATSError(err);
-                                            // Single retry after reconnection attempt
-                                            self.reconnectNATS();
-                                            if (self.nats) |retry_nats| {
-                                                retry_nats.writeAll(nats_msg) catch |retry_err| {
-                                                    self.handleNATSError(retry_err);
-                                                };
-                                            }
-                                        };
-                                    } else {
-                                        self.handleNATSError(error.NullConnection);
-                                        self.reconnectNATS();
-                                        if (self.nats) |nats| {
-                                            nats.writeAll(nats_msg) catch |err| {
-                                                self.handleNATSError(err);
-                                            };
-                                        }
-                                    }
                                     continue;
                                 }
 
