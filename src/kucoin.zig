@@ -190,8 +190,8 @@ pub fn connectWebSocket(self: *Self) !void {
         .port = port,
         .host = host,
         .tls = is_tls,
-        .max_size = 65536,
-        .buffer_size = 4096,
+        .max_size = 4096,
+        .buffer_size = 1024,
     });
 
     const request_path = try std.fmt.allocPrint(self.allocator, "/?token={s}", .{self.token.?});
