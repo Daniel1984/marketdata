@@ -1,35 +1,9 @@
 const std = @import("std");
 const ws = @import("websocket");
 const request = @import("./request.zig");
+const types = @import("./types.zig");
 const json = std.json;
 const crypto = std.crypto;
-
-const KuCoinTokenResponse = struct {
-    code: []const u8,
-    data: struct {
-        token: []const u8,
-        instanceServers: []struct {
-            endpoint: []const u8,
-            encrypt: bool,
-            protocol: []const u8,
-            pingInterval: u64,
-            pingTimeout: u64,
-        },
-    },
-};
-
-const SubscribeMessage = struct {
-    id: u64,
-    type: []const u8,
-    topic: []const u8,
-    response: bool,
-};
-
-const MessageEnvelope = struct {
-    type: []const u8,
-    source: []const u8,
-    data: []const u8,
-};
 
 pub const Self = @This();
 
@@ -134,7 +108,7 @@ pub fn getSocketConnectionDetails(self: *Self) !void {
     const body = try request.post(self.allocator, "https://api.kucoin.com/api/v1/bullet-public");
     defer self.allocator.free(body);
 
-    const parsedBody = try json.parseFromSlice(KuCoinTokenResponse, self.allocator, body, .{ .ignore_unknown_fields = true });
+    const parsedBody = try json.parseFromSlice(types.KuCoinTokenResponse, self.allocator, body, .{ .ignore_unknown_fields = true });
     defer parsedBody.deinit();
 
     if (!std.mem.eql(u8, parsedBody.value.code, "200000")) return error.ConnectionError;
@@ -217,7 +191,7 @@ pub fn subscribeChannel(self: *Self, topic: []const u8) !void {
         id = (id << 8) | byte;
     }
 
-    const subscribe_msg = SubscribeMessage{
+    const subscribe_msg = types.SubscribeMessage{
         .id = id,
         .type = "subscribe",
         .topic = topic,
@@ -288,7 +262,7 @@ pub fn consume(self: *Self) !void {
 
                                 if (std.mem.eql(u8, type_str, "message")) {
                                     // Create envelope
-                                    const envelope = MessageEnvelope{
+                                    const envelope = types.MessageEnvelope{
                                         .type = "orderbook",
                                         .source = "kucoin",
                                         .data = msg.data,
