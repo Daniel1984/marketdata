@@ -8,6 +8,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     var publisher = try stream.init(allocator, .{});
+    defer publisher.deinit();
     try publisher.connect();
 
     var kc = try kucoin.init(allocator, publisher);
