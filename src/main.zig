@@ -1,16 +1,16 @@
 const std = @import("std");
 const kucoin = @import("./kucoin.zig");
-const nats_broadcaster = @import("./nats-broadcaster.zig");
+const stream = @import("./stream.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var nats = try nats_broadcaster.NatsBroadcaster.init(allocator, "0.0.0.0", 4222);
-    defer nats.deinit();
+    var publisher = try stream.init(allocator, .{});
+    try publisher.connect();
 
-    var kc = kucoin.init(allocator, &nats);
+    var kc = try kucoin.init(allocator, publisher);
     defer kc.deinit();
 
     try kc.getSocketConnectionDetails();

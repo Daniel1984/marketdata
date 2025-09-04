@@ -36,6 +36,10 @@
             .url = "git+https://github.com/karlseguin/websocket.zig.git?ref=master#59aaa71e64a669aa90016f8a342ceeee6381b4a6",
             .hash = "websocket-0.1.0-ZPISdYluAwBl2ckLPQ_q5_1IPEmNmaJ9vU1V0ap1-_dD",
         },
+        .zimq = .{
+            .url = "git+https://github.com/uyha/zimq.git#1ca5079a202446ece4eae4e097cdd12a97b20577",
+            .hash = "zimq-0.0.0-nw1ioBKkAQCaEY1IYFUF-w_CTwtIf7SR55GDjaJozQhI",
+        },
     },
     .paths = .{
         "build.zig",

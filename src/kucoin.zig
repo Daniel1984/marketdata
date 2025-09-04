@@ -1,8 +1,9 @@
 const std = @import("std");
 const ws = @import("websocket");
+const zimq = @import("zimq");
 const request = @import("./request.zig");
 const types = @import("./types.zig");
-const nats_broadcaster = @import("./nats-broadcaster.zig");
+const str = @import("./stream.zig");
 const json = std.json;
 const crypto = std.crypto;
 
@@ -15,9 +16,9 @@ ping_interval: u64,
 ping_timeout: u64,
 mutex: std.Thread.Mutex,
 client: ?ws.Client,
-nats: *nats_broadcaster.NatsBroadcaster,
+stream: str.Self,
 
-pub fn init(allocator: std.mem.Allocator, nats: *nats_broadcaster.NatsBroadcaster) Self {
+pub fn init(allocator: std.mem.Allocator, stream: str.Self) !Self {
     return Self{
         .allocator = allocator,
         .token = null,
@@ -26,7 +27,7 @@ pub fn init(allocator: std.mem.Allocator, nats: *nats_broadcaster.NatsBroadcaste
         .ping_timeout = 10000,
         .mutex = std.Thread.Mutex{},
         .client = null,
-        .nats = nats,
+        .stream = stream,
     };
 }
 
@@ -205,8 +206,9 @@ pub fn consume(self: *Self) !void {
                                 }
 
                                 if (std.mem.eql(u8, type_str, "message")) {
-                                    self.nats.publishMessage("market", .{ .data = msg.data, .type = "orderbook", .source = "kucoin" }) catch |err| {
-                                        std.log.warn("Failed to publish to NATS: {}", .{err});
+                                    // std.debug.print("pushing to zmq...", .{});
+                                    self.stream.publishMessage(.{ .data = msg.data, .type = "orderbook", .source = "kucoin" }) catch |err| {
+                                        std.log.warn("failed publishing msg: {}", .{err});
                                     };
                                     continue;
                                 }
