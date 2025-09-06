@@ -146,12 +146,8 @@ pub fn subscribeChannel(self: *Self, topic: []const u8) !void {
     const subscribe_json = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(subscribe_msg, .{})});
     defer self.allocator.free(subscribe_json);
 
-    std.log.info("subscribing to {s}...", .{topic});
     std.log.info("subscription payload: {s}", .{subscribe_json});
-
-    self.client.?.write(subscribe_json) catch |err| {
-        std.log.err("Failed to subscribe to {s}: {}", .{ topic, err });
-    };
+    try self.client.?.write(subscribe_json);
 }
 
 pub fn consume(self: *Self) !void {
@@ -206,8 +202,14 @@ pub fn consume(self: *Self) !void {
                                 }
 
                                 if (std.mem.eql(u8, type_str, "message")) {
-                                    // std.debug.print("pushing to zmq...", .{});
-                                    self.stream.publishMessage(.{ .data = msg.data, .type = "orderbook", .source = "kucoin" }) catch |err| {
+                                    // Transform Kucoin response data to match common format
+                                    const transformed_data = self.transformOrderbookData(msg.data) catch |err| {
+                                        std.log.warn("failed to transform orderbook data: {}", .{err});
+                                        continue;
+                                    };
+                                    defer self.allocator.free(transformed_data);
+
+                                    self.stream.publishMessage(transformed_data) catch |err| {
                                         std.log.warn("failed publishing msg: {}", .{err});
                                     };
                                     continue;
@@ -243,4 +245,54 @@ pub fn consume(self: *Self) !void {
     }
 
     std.log.info("WebSocket connection closed", .{});
+}
+
+fn transformOrderbookData(self: *Self, original_data: []const u8) ![]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, original_data, .{}) catch |err| {
+        std.log.warn("Failed to parse Bybit message for transformation: {}", .{err});
+        return err;
+    };
+    defer parsed.deinit();
+
+    // Clone the original structure
+    var root_obj = std.json.ObjectMap.init(self.allocator);
+    defer root_obj.deinit();
+
+    var pair_string: ?[]u8 = null;
+    defer if (pair_string) |p| self.allocator.free(p);
+
+    try root_obj.put("src", std.json.Value{ .string = "kucoin" });
+    try root_obj.put("type", std.json.Value{ .string = "orderbook" });
+
+    if (parsed.value.object.get("timestamp")) |ts| {
+        try root_obj.put("ts", ts);
+    }
+
+    if (parsed.value.object.get("topic")) |topic| {
+        if (topic == .string) {
+            const topic_str = topic.string;
+            if (std.mem.indexOf(u8, topic_str, ":")) |colon_index| {
+                const pair_with_dash = topic_str[colon_index + 1 ..];
+                const pair = try std.mem.replaceOwned(u8, self.allocator, pair_with_dash, "-", "");
+                pair_string = pair;
+                try root_obj.put("pair", std.json.Value{ .string = pair });
+            }
+        }
+    }
+
+    if (parsed.value.object.get("data")) |data_value| {
+        var data_obj = std.json.ObjectMap.init(self.allocator);
+        defer data_obj.deinit();
+
+        if (data_value.object.get("bids")) |b| {
+            try root_obj.put("bids", b);
+        }
+
+        if (data_value.object.get("asks")) |a| {
+            try root_obj.put("asks", a);
+        }
+    }
+
+    const root_json_value = std.json.Value{ .object = root_obj };
+    return try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(root_json_value, .{})});
 }

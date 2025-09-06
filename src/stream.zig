@@ -78,16 +78,13 @@ fn reconnect(self: *Self) void {
     std.log.err("failed to reconnect stream after {} attempts", .{attempts});
 }
 
-pub fn publishMessage(self: *Self, pld: types.MessageEnvelope) !void {
-    const pld_json = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(pld, .{})});
-    defer self.allocator.free(pld_json);
-
+pub fn publishMessage(self: *Self, pld: []u8) !void {
     if (self.socket) |socket| {
-        socket.sendSlice(pld_json, .{}) catch |err| {
+        socket.sendSlice(pld, .{}) catch |err| {
             std.log.err("write to stream err: {}", .{err});
             self.reconnect();
             if (self.socket) |retry_socket| {
-                retry_socket.sendSlice(pld_json, .{}) catch |retry_err| {
+                retry_socket.sendSlice(pld, .{}) catch |retry_err| {
                     std.log.err("reconnected failet to publish msg: {}", .{retry_err});
                     return retry_err;
                 };
@@ -98,7 +95,7 @@ pub fn publishMessage(self: *Self, pld: types.MessageEnvelope) !void {
     } else {
         self.reconnect();
         if (self.socket) |socket| {
-            socket.sendSlice(pld_json, .{}) catch |err| {
+            socket.sendSlice(pld, .{}) catch |err| {
                 std.log.warn("failed to publish msg: {}", .{err});
                 return err;
             };
