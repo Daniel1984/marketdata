@@ -152,7 +152,7 @@ pub fn subscribeChannel(self: *Self, topic: []const u8) !void {
 
 pub fn consume(self: *Self) !void {
     // Set a read timeout
-    try self.client.?.readTimeout(5000); // 5 second timeout
+    try self.client.?.readTimeout(2000);
 
     // Handle incoming messages
     var ping_timer = try std.time.Timer.start();
