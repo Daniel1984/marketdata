@@ -17,6 +17,7 @@ ping_timeout: u64,
 mutex: std.Thread.Mutex,
 client: ?ws.Client,
 stream: str.Self,
+current_topic: ?[]u8,
 
 pub fn init(allocator: std.mem.Allocator, stream: str.Self) !Self {
     return Self{
@@ -28,6 +29,7 @@ pub fn init(allocator: std.mem.Allocator, stream: str.Self) !Self {
         .mutex = std.Thread.Mutex{},
         .client = null,
         .stream = stream,
+        .current_topic = null,
     };
 }
 
@@ -40,6 +42,14 @@ pub fn deinit(self: *Self) void {
         self.allocator.free(endpoint);
         self.endpoint = null;
     }
+    if (self.current_topic) |topic| {
+        self.allocator.free(topic);
+        self.current_topic = null;
+    }
+    self.deinitClient();
+}
+
+fn deinitClient(self: *Self) void {
     if (self.client) |*client| {
         client.deinit();
         self.client = null;
@@ -128,6 +138,12 @@ pub fn connectWebSocket(self: *Self) !void {
 }
 
 pub fn subscribeChannel(self: *Self, topic: []const u8) !void {
+    // Store current topic for reconnection
+    if (self.current_topic) |old_topic| {
+        self.allocator.free(old_topic);
+    }
+    self.current_topic = try self.allocator.dupe(u8, topic);
+
     // Generate random ID
     var random_bytes: [8]u8 = undefined;
     crypto.random.bytes(&random_bytes);
@@ -150,29 +166,110 @@ pub fn subscribeChannel(self: *Self, topic: []const u8) !void {
     try self.client.?.write(subscribe_json);
 }
 
-pub fn consume(self: *Self) !void {
-    // Set a read timeout
-    try self.client.?.readTimeout(2000);
+fn reconnect(self: *Self) !void {
+    self.deinitClient();
 
-    // Handle incoming messages
+    var retry_count: u32 = 0;
+    const max_retries = 5;
+    var backoff_ms: u64 = 1000;
+
+    while (retry_count < max_retries) {
+        std.log.info("reconnection attempt {}/{}", .{ retry_count + 1, max_retries });
+
+        if (retry_count > 0) {
+            std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+            backoff_ms *= 2;
+        }
+
+        // Get new token and endpoint
+        self.getSocketConnectionDetails() catch |token_err| {
+            std.log.warn("failed to get socket connection details on attempt {}: {}", .{ retry_count + 1, token_err });
+            retry_count += 1;
+            continue;
+        };
+
+        // Establish websocket connection
+        self.connectWebSocket() catch |reconnect_err| {
+            std.log.warn("reconnection attempt {} failed: {}", .{ retry_count + 1, reconnect_err });
+            retry_count += 1;
+            continue;
+        };
+
+        // Re-subscribe if we have a topic
+        if (self.current_topic) |topic| {
+            // Wait a moment for connection to stabilize
+            std.Thread.sleep(500 * std.time.ns_per_ms);
+
+            // Generate random ID
+            var random_bytes: [8]u8 = undefined;
+            crypto.random.bytes(&random_bytes);
+            var id: u64 = 0;
+            for (random_bytes) |byte| {
+                id = (id << 8) | byte;
+            }
+
+            const subscribe_msg = types.SubscribeMessage{
+                .id = id,
+                .type = "subscribe",
+                .topic = topic,
+                .response = true,
+            };
+
+            const subscribe_json = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(subscribe_msg, .{})});
+            defer self.allocator.free(subscribe_json);
+
+            std.log.info("re-subscribing to: {s}", .{topic});
+            self.client.?.write(subscribe_json) catch |sub_err| {
+                std.log.warn("re-subscription failed: {}", .{sub_err});
+                retry_count += 1;
+                continue;
+            };
+        }
+
+        std.log.info("reconnected successfully after {} attempts", .{retry_count + 1});
+        return;
+    } else {
+        std.log.err("failed to reconnect after {} attempts", .{max_retries});
+        return error.ReconnectionFailed;
+    }
+}
+
+pub fn consume(self: *Self) !void {
+    std.log.info("starting message consumption", .{});
+
+    // Initialize ping timer outside the main loop to maintain timing across reconnections
     var ping_timer = try std.time.Timer.start();
-    const ping_interval_ns = self.ping_interval * std.time.ns_per_ms;
 
     while (true) {
+        // Set a read timeout
+        self.client.?.readTimeout(2000) catch |err| {
+            std.log.err("failed to set read timeout: {} - attempting reconnection", .{err});
+            try self.reconnect();
+            ping_timer.reset(); // Reset timer after reconnection
+            continue;
+        };
+
+        // Handle incoming messages
+        const ping_interval_ns = self.ping_interval * std.time.ns_per_ms;
+
         // Check if we need to send a ping
         if (ping_timer.read() >= ping_interval_ns) {
             var ping_data = [_]u8{};
             self.client.?.writePing(&ping_data) catch |err| {
-                std.log.err("Failed to send ping: {}", .{err});
-                return err; // Exit consume loop on ping failure
+                std.log.err("failed to send ping: {} - attempting reconnection", .{err});
+                try self.reconnect();
+                ping_timer.reset(); // Reset timer after reconnection
+                continue;
             };
             std.log.info("Sent ping", .{});
             ping_timer.reset();
         }
 
         const message = self.client.?.read() catch |err| {
-            std.log.err("failed reading raw message: {}", .{err});
-            return err; // Exit consume loop on read failure
+            std.log.err("read error: {} - attempting reconnection", .{err});
+            try self.reconnect();
+            ping_timer.reset(); // Reset timer after reconnection
+            continue;
         };
 
         if (message) |msg| {
@@ -209,6 +306,7 @@ pub fn consume(self: *Self) !void {
                                     };
                                     defer self.allocator.free(transformed_data);
 
+                                    // std.debug.print("::: transformed_data :> {s}\n", .{transformed_data});
                                     self.stream.publishMessage(transformed_data) catch |err| {
                                         std.log.warn("failed publishing msg: {}", .{err});
                                     };

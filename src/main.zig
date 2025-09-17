@@ -17,7 +17,11 @@ pub fn main() !void {
     try kc.getSocketConnectionDetails();
     try kc.connectWebSocket();
     try kc.subscribeChannel("/spotMarket/level2Depth5:BTC-USDT");
-    try kc.consume();
+
+    kc.consume() catch |err| {
+        std.log.err("Consumer failed with error: {}", .{err});
+        return err;
+    };
 
     std.log.info("WebSocket connection closed", .{});
 }
